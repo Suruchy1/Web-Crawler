@@ -1,108 +1,152 @@
+
 package utb.fai;
 
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+
 import java.net.URI;
-import java.util.HashSet;
-import java.util.LinkedList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-import javax.swing.text.MutableAttributeSet;
-import javax.swing.text.html.HTML;
-import javax.swing.text.html.HTMLEditorKit;
+class ParserCallback {
 
-/**
- * Třída ParserCallback je používána parserem DocumentParser,
- * je implementován přímo v JDK a umí parsovat HTML do verze 3.0.
- * Při parsování (analýze) HTML stránky volá tento parser
- * jednotlivé metody třídy ParserCallback, co nám umožuje
- * provádět s částmi HTML stránky naše vlastní akce.
- * 
- * @author Tomá Dulík
- */
-class ParserCallback extends HTMLEditorKit.ParserCallback {
-
-    /**
-     * pageURI bude obsahovat URI aktuální parsované stránky. Budeme
-     * jej vyuívat pro resolving všech URL, které v kódu stránky najdeme
-     * - předtím, než nalezené URL uložíme do foundURLs, musíme z něj udělat
-     * absolutní URL!
-     */
     URI pageURI;
 
-    /**
-     * depth bude obsahovat aktuální hloubku zanoření
-     */
-    int depth = 0, maxDepth = 5;
+    int depth;
+    int maxDepth;
 
-    /**
-     * visitedURLs je množina všech URL, které jsme již navtívili
-     * (parsovali). Pokud najdeme na stránce URL, který je v této množině,
-     * nebudeme jej u dále parsovat
-     */
-    HashSet<URI> visitedURIs;
+    ConcurrentHashMap<URI, Boolean> visitedURIs;
 
-    /**
-     * foundURLs jsou všechna nová (zatím nenavštívená) URL, která na stránce
-     * najdeme. Poté, co projdeme celou stránku, budeme z tohoto seznamu
-     * jednotlivá URL brát a zpracovávat.
-     */
-    LinkedList<URIinfo> foundURIs;
+    ConcurrentHashMap<String, LongAdder> wordCounts;
 
-    /** pokud debugLevel>1, budeme vypisovat debugovací hlášky na std. error */
-    int debugLevel = 0;
+    private static final Pattern WORD_PATTERN =
+            Pattern.compile("[\\p{L}\\p{N}]+");
 
-    ParserCallback(HashSet<URI> visitedURIs, LinkedList<URIinfo> foundURIs) {
-        this.foundURIs = foundURIs;
+    ParserCallback(
+            ConcurrentHashMap<URI, Boolean> visitedURIs,
+            ConcurrentHashMap<String, LongAdder> wordCounts,
+            URIinfo info,
+            int maxDepth
+    ) {
         this.visitedURIs = visitedURIs;
+        this.wordCounts = wordCounts;
+        this.pageURI = info.uri;
+        this.depth = info.depth;
+        this.maxDepth = maxDepth;
     }
 
-    /**
-     * metoda handleSimpleTag se volá např. u značky <FRAME>
-     */
-    public void handleSimpleTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        handleStartTag(t, a, pos);
-    }
+    public void analyzePage() {
 
-    public void handleStartTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        URI uri;
-        String href = null;
-        if (debugLevel > 1)
-            System.err.println("handleStartTag: " + t.toString() + ", pos=" + pos + ", attribs=" + a.toString());
-        if (depth <= maxDepth)
-            if (t == HTML.Tag.A)
-                href = (String) a.getAttribute(HTML.Attribute.HREF);
-            else if (t == HTML.Tag.FRAME)
-                href = (String) a.getAttribute(HTML.Attribute.SRC);
-        if (href != null)
-            try {
-                uri = pageURI.resolve(href);
-                if (!uri.isOpaque() && !visitedURIs.contains(uri)) {
-                    visitedURIs.add(uri);
-                    foundURIs.add(new URIinfo(uri, depth + 1));
-                    if (debugLevel > 0)
-                        System.err.println("Adding URI: " + uri.toString());
-                }
-            } catch (Exception e) {
-                System.err.println("Nalezeno nekorektní URI: " + href);
-                e.printStackTrace();
+        try {
+            if (App.debugLevel > 0) {
+                System.err.println("Analyzing " + pageURI);
             }
 
+            Document document = Jsoup.connect(pageURI.toString())
+                    .userAgent("Mozilla/5.0")
+                    .timeout(10000)
+                    .maxBodySize(2 * 1024 * 1024)
+                    .followRedirects(true)
+                    .get();
+
+            document.select(
+                    "script, style, noscript, iframe, svg, canvas, " +
+                    "template, head"
+            ).remove();
+
+            String text = document.body() != null
+                    ? document.body().text()
+                    : document.text();
+
+            handleText(text);
+
+            if (depth < maxDepth) {
+                findLinks(document);
+            }
+
+        } catch (Exception e) {
+            if (App.debugLevel > 0) {
+                System.err.println(
+                        "Error loading page: " + pageURI +
+                        " - " + e.getMessage()
+                );
+            }
+        }
     }
 
-    /******************************************************************
-     * V metodě handleText bude probíhat veškerá činnost, související se
-     * zjiováním četnosti slov v textovém obsahu HTML stránek.
-     * IMPLEMENTACE TÉTO METODY JE V TÉTO ÚLOZE VAŠÍM ÚKOLEM !!!!
-     * Možný postup:
-     * Ve třídě Parser (klidně v její metodě main) si vytvořte vyhledávací tabulku
-     * =instanci třídy HashMap<String,Integer> nebo TreeMap<String,Integer>.
-     * Do této tabulky si ukládejte dvojice klíč-data, kde
-     * klíčem jsou jednotlivá slova z textového obsahu HTML stránek,
-     * data typu Integer bude dosavadní počet výskytu daného slova v
-     * HTML stránkách.
-     *******************************************************************/
-    public void handleText(char[] data, int pos) {
-        System.out.println("handleText: " + String.valueOf(data) + ", pos=" + pos);
-        /**
-         * ...tady bude vaše implementace...
-         */
+    private void findLinks(Document document) {
+
+        for (Element element : document.select("a[href], frame[src], iframe[src]")) {
+
+            String link;
+
+            if (element.hasAttr("href")) {
+                link = element.absUrl("href");
+            } else {
+                link = element.absUrl("src");
+            }
+
+            if (link.isEmpty()) {
+                continue;
+            }
+
+            try {
+                URI uri = pageURI.resolve(link).normalize();
+
+                String scheme = uri.getScheme();
+
+                if (scheme == null ||
+                        (!scheme.equalsIgnoreCase("http")
+                                && !scheme.equalsIgnoreCase("https"))) {
+                    continue;
+                }
+
+                uri = new URI(
+                        scheme.toLowerCase(),
+                        uri.getUserInfo(),
+                        uri.getHost() != null
+                                ? uri.getHost().toLowerCase()
+                                : null,
+                        uri.getPort(),
+                        uri.getPath(),
+                        uri.getQuery(),
+                        null
+                );
+
+                if (visitedURIs.putIfAbsent(uri, true) == null) {
+
+                    URIinfo newInfo = new URIinfo(uri, depth + 1);
+
+                    App.submitPage(newInfo);
+
+                    if (App.debugLevel > 0) {
+                        System.err.println("Adding URI: " + uri);
+                    }
+                }
+
+            } catch (Exception e) {
+                if (App.debugLevel > 1) {
+                    System.err.println("Invalid URI: " + link);
+                }
+            }
+        }
+    }
+
+    public void handleText(String text) {
+
+        Matcher matcher = WORD_PATTERN.matcher(text.toLowerCase());
+
+        while (matcher.find()) {
+
+            String word = matcher.group();
+
+            wordCounts.computeIfAbsent(
+                    word,
+                    key -> new LongAdder()
+            ).increment();
+        }
     }
 }

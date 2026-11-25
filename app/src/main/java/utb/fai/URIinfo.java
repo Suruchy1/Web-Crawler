@@ -1,3 +1,4 @@
+
 package utb.fai;
 
 import java.net.URI;
@@ -17,9 +18,9 @@ public class URIinfo {
         try {
             this.uri = new URI(str);
         } catch (URISyntaxException e) {
-            e.printStackTrace();
+            throw new IllegalArgumentException("Invalid URI: " + str, e);
         }
+
         this.depth = depth;
     }
-
 }
